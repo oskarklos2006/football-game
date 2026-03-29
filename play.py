@@ -1,6 +1,6 @@
 """
 play.py
-Run the 2v2 soccer game with random actions.
+Run the 3v3 soccer game with random actions.
 Close the window or press ESC to quit.
 
 Usage:
