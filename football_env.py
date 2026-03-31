@@ -3,8 +3,8 @@ football_env.py
 6v6 Soccer environment built on Gymnasium.
 
 Coordinate system:
-  x: 0 (left goal) → FIELD_W (right goal)
-  y: 0 (top)       → FIELD_H (bottom)
+  x: 0 (left goal) - FIELD_W right goal
+  y: 0 (top)       - FIELD_H bottom
 
 Team A attacks right (+x), defends left.
 Team B attacks left  (-x), defends right.
@@ -14,9 +14,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# ---------------------------------------------------------------------------
 # Field constants
-# ---------------------------------------------------------------------------
 FIELD_W = 50.0
 FIELD_H = 30.0
 GOAL_H  = 10.0
@@ -25,17 +23,15 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 
 PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
-MAX_SPEED     = 1.3       # units per step — feels natural on a 50x30 field
-KICK_POWER    = 3.0       # gentle enough to stay on the pitch
-FRICTION      = 0.88      # slightly more friction so ball doesn't fly off
+MAX_SPEED     = 1.3       
+KICK_POWER    = 3.0       
+FRICTION      = 0.88      
 MAX_STEPS     = 1000
 
 N_PLAYERS = 12            # 6 per team
 
 
-# ---------------------------------------------------------------------------
 # Observation helper
-# ---------------------------------------------------------------------------
 def _obs_for_team(agent_positions, agent_velocities, ball_pos, ball_vel,
                   team_idx: int) -> np.ndarray:
     """
@@ -73,12 +69,10 @@ def _obs_for_team(agent_positions, agent_velocities, ball_pos, ball_vel,
         -1, 1
     )
     obs.append(ball_vel_norm)
-    return np.concatenate(obs)   # shape (52,)
+    return np.concatenate(obs)   
 
 
-# ---------------------------------------------------------------------------
 # Environment
-# ---------------------------------------------------------------------------
 class SoccerEnv(gym.Env):
     """
     6v6 soccer environment.
@@ -135,7 +129,6 @@ class SoccerEnv(gym.Env):
         self._score = [0, 0]
         self._renderer = None
 
-    # -- reset ---------------------------------------------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_positions()
@@ -165,7 +158,6 @@ class SoccerEnv(gym.Env):
         self._ball_pos = np.array([cx, cy], dtype=np.float32)
         self._ball_vel = np.zeros(2, dtype=np.float32)
 
-    # -- step ----------------------------------------------------------------
     def step(self, actions):
         a_act = np.clip(actions["team_a"], -1, 1)
         b_act = np.clip(actions["team_b"], -1, 1)
@@ -251,7 +243,6 @@ class SoccerEnv(gym.Env):
             {"score": self._score.copy(), "step": self._step_count},
         )
 
-    # -- rewards -------------------------------------------------------------
     def _compute_rewards(self):
         r = self.reward_cfg
         bx = self._ball_pos[0]
@@ -277,7 +268,6 @@ class SoccerEnv(gym.Env):
             return "team_b"
         return None
 
-    # -- observations --------------------------------------------------------
     def _get_obs(self):
         return {
             "team_a": _obs_for_team(self._pos, self._vel,
@@ -286,7 +276,6 @@ class SoccerEnv(gym.Env):
                                     self._ball_pos, self._ball_vel, 1),
         }
 
-    # -- render --------------------------------------------------------------
     def render(self):
         if self.render_mode is None:
             return
