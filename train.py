@@ -59,62 +59,69 @@ class TeamAEnv(gym.Env):
         """
         Custom reward shaping exclusively for team_a.
 
-        Components (rough priority order):
-          1. Pass completed          +1.5   ← most important
-          2. Ball touch (1 player)   +0.15  ← only the closest, not everyone
-          3. Ball moving toward goal +0.3   ← when ball velocity points right
-          4. Ball position progress  +0.06  ← per step, scaled by ball x
-          5. Team spread bonus       +0.04  ← reward spatial coverage
-          6. Clustering penalty      -0.15  ← punish two players < 3 units apart
-          7. Goal rewards            kept from env (+10 / -10)
+          1. Closest player chases ball      +0.2   ← scales with proximity
+          2. Ball touch (closest only)       +0.15
+          3. Pass completed                  +0.8   ← most important skill
+          4. Support positioning             +0.02  ← non-chasers near ball (5-20u)
+          5. Too-far penalty                 -0.05  ← stops hiding in corners
+          6. Boundary penalty                -0.12  ← stops hugging walls
+          7. Ball moving toward goal         +0.25
+          8. Ball position progress          +0.04
+          9. Goal rewards                    kept from env (+10 / -10)
         """
         pos      = self._env._pos        # (12,2)
         ball     = self._env._ball_pos   # (2,)
         ball_vel = self._env._ball_vel   # (2,)
-        reward   = goal_reward           # start with +10/-10 if a goal happened
+        reward   = goal_reward
 
-        team_a = pos[:6]   # players 0-5
+        team_a = pos[:6]
 
-        # ── 1 & 2. Touch + Pass ──────────────────────────────────────────────
         dists = np.linalg.norm(team_a - ball, axis=1)   # (6,)
-        closest_i   = int(np.argmin(dists))
+        closest_i    = int(np.argmin(dists))
         closest_dist = dists[closest_i]
 
+        # ── 1. Closest player rewarded for being near ball ───────────────────
+        # Smooth gradient: full reward at 0 distance, zero at 20 units away
+        reward += 0.2 * max(0.0, 1.0 - closest_dist / 20.0)
+
+        # ── 2 & 3. Touch + Pass ──────────────────────────────────────────────
         if closest_dist < KICK_RANGE:
-            # Only the closest player gets a touch reward
             reward += 0.15
 
-            # Pass: a different team_a player is now closest → pass completed
             if self._last_toucher is not None and self._last_toucher != closest_i:
-                reward += 1.5
+                reward += 0.8   # pass completed
 
             self._last_toucher = closest_i
         else:
-            # Ball not near anyone — reset pass chain
             self._last_toucher = None
 
-        # ── 3. Ball moving toward opponent goal ──────────────────────────────
-        # Reward when ball velocity has a strong rightward (positive x) component
-        if ball_vel[0] > 0.5:
-            reward += 0.3 * (ball_vel[0] / KICK_POWER)
-
-        # ── 4. Ball position progress ────────────────────────────────────────
-        reward += 0.06 * (ball[0] / FIELD_W)
-
-        # ── 5. Team spread bonus ─────────────────────────────────────────────
-        # Reward standard deviation of player positions — spread out team plays better
-        spread = float(np.std(team_a, axis=0).mean())
-        reward += 0.04 * spread
-
-        # ── 6. Clustering penalty ────────────────────────────────────────────
-        # Penalise pairs of team_a players that are too close to each other
+        # ── 4 & 5. Support positions for non-chasing players ─────────────────
+        # They should stay 5-20 units from ball (available for a pass, not clustering)
         for i in range(6):
-            for j in range(i + 1, 6):
-                d = np.linalg.norm(team_a[i] - team_a[j])
-                if d < 3.0:
-                    reward -= 0.15
+            if i == closest_i:
+                continue
+            d = dists[i]
+            if 5.0 < d < 20.0:
+                reward += 0.02   # good support position
+            elif d > 30.0:
+                reward -= 0.05   # too far away, probably hiding
 
-        self._last_ball_pos = ball.copy()
+        # ── 6. Boundary penalty ───────────────────────────────────────────────
+        # Explicitly punish hugging the edges/corners of the field
+        MARGIN = 4.0
+        for i in range(6):
+            px, py = team_a[i]
+            if px < MARGIN or px > FIELD_W - MARGIN or \
+               py < MARGIN or py > FIELD_H - MARGIN:
+                reward -= 0.12
+
+        # ── 7. Ball moving toward opponent goal ───────────────────────────────
+        if ball_vel[0] > 0.5:
+            reward += 0.25 * (ball_vel[0] / KICK_POWER)
+
+        # ── 8. Ball position progress ─────────────────────────────────────────
+        reward += 0.04 * (ball[0] / FIELD_W)
+
         return reward
 
     def step(self, action_a):
