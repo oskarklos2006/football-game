@@ -24,8 +24,8 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
 MAX_SPEED     = 1.3       
-KICK_POWER    = 3.0       
-FRICTION      = 0.88      
+KICK_POWER    = 1.0
+FRICTION      = 0.93
 MAX_STEPS     = 1000
 
 N_PLAYERS = 12            # 6 per team

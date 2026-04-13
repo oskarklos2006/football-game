@@ -12,7 +12,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 
 from football_env import (
     SoccerEnv, FIELD_W, FIELD_H,
-    PLAYER_RADIUS, BALL_RADIUS, KICK_POWER, MAX_SPEED
+    PLAYER_RADIUS, BALL_RADIUS
 )
 
 KICK_RANGE = PLAYER_RADIUS + BALL_RADIUS + 0.5   # same as env internals
@@ -27,7 +27,7 @@ class TeamAEnv(gym.Env):
 
     def __init__(self, render_mode=None, opponent_model=None):
         super().__init__()
-        # Zero out the env's built-in shaping rewards — we replace them below.
+        # Zero out built-in shaping rewards — custom shaping below handles everything.
         # Goal scored/conceded are kept at their defaults (+10 / -10).
         self._env = SoccerEnv(render_mode=render_mode, reward_cfg={
             "ball_to_goal": 0.0,
@@ -57,22 +57,19 @@ class TeamAEnv(gym.Env):
 
     def _custom_reward(self, goal_reward):
         """
-        Custom reward shaping exclusively for team_a.
+        Reward shaping for team_a.
 
-          1. Closest player chases ball      +0.2   ← scales with proximity
-          2. Ball touch (closest only)       +0.15
-          3. Pass completed                  +0.8   ← most important skill
-          4. Support positioning             +0.02  ← non-chasers near ball (5-20u)
-          5. Too-far penalty                 -0.05  ← stops hiding in corners
-          6. Boundary penalty                -0.12  ← stops hugging walls
-          7. Ball moving toward goal         +0.25
-          8. Ball position progress          +0.04
-          9. Goal rewards                    kept from env (+10 / -10)
+          1. Closest player chases ball      +0.3   ← scaled by proximity
+          2. Ball touch                      +0.3
+          3. Pass completed                  +2.0   ← dominant signal
+          4. Support positioning             +0.05  ← non-chasers spread out
+          5. Too-far penalty                 -0.1   ← stops hiding
+          6. Boundary penalty                -0.15  ← stops hugging walls
+          7. Goal scored / conceded          +10 / -10
         """
         pos      = self._env._pos        # (12,2)
         ball     = self._env._ball_pos   # (2,)
-        ball_vel = self._env._ball_vel   # (2,)
-        reward   = goal_reward
+        reward   = goal_reward           # +10 / -10 on goals
 
         team_a = pos[:6]
 
@@ -80,47 +77,37 @@ class TeamAEnv(gym.Env):
         closest_i    = int(np.argmin(dists))
         closest_dist = dists[closest_i]
 
-        # ── 1. Closest player rewarded for being near ball ───────────────────
-        # Smooth gradient: full reward at 0 distance, zero at 20 units away
-        reward += 0.2 * max(0.0, 1.0 - closest_dist / 20.0)
+        # ── 1. Closest player chases ball ────────────────────────────────────
+        reward += 0.3 * max(0.0, 1.0 - closest_dist / 20.0)
 
         # ── 2 & 3. Touch + Pass ──────────────────────────────────────────────
         if closest_dist < KICK_RANGE:
-            reward += 0.15
+            reward += 0.3   # touching the ball
 
             if self._last_toucher is not None and self._last_toucher != closest_i:
-                reward += 0.8   # pass completed
+                reward += 2.0   # pass completed — strongest signal
 
             self._last_toucher = closest_i
         else:
             self._last_toucher = None
 
         # ── 4 & 5. Support positions for non-chasing players ─────────────────
-        # They should stay 5-20 units from ball (available for a pass, not clustering)
         for i in range(6):
             if i == closest_i:
                 continue
             d = dists[i]
             if 5.0 < d < 20.0:
-                reward += 0.02   # good support position
+                reward += 0.05   # good support position
             elif d > 30.0:
-                reward -= 0.05   # too far away, probably hiding
+                reward -= 0.1    # too far away
 
         # ── 6. Boundary penalty ───────────────────────────────────────────────
-        # Explicitly punish hugging the edges/corners of the field
-        MARGIN = 4.0
+        margin = 4.0
         for i in range(6):
             px, py = team_a[i]
-            if px < MARGIN or px > FIELD_W - MARGIN or \
-               py < MARGIN or py > FIELD_H - MARGIN:
-                reward -= 0.12
-
-        # ── 7. Ball moving toward opponent goal ───────────────────────────────
-        if ball_vel[0] > 0.5:
-            reward += 0.25 * (ball_vel[0] / KICK_POWER)
-
-        # ── 8. Ball position progress ─────────────────────────────────────────
-        reward += 0.04 * (ball[0] / FIELD_W)
+            if px < margin or px > FIELD_W - margin or \
+               py < margin or py > FIELD_H - margin:
+                reward -= 0.15
 
         return reward
 
@@ -146,7 +133,7 @@ class TeamAEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    TOTAL_STEPS    = 500_000
+    TOTAL_STEPS    = 1_000_000
     SAVE_EVERY     = 50_000
     MODEL_NAME     = "team_a"
     LOG_DIR        = "./logs/"
