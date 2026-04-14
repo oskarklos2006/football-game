@@ -59,17 +59,18 @@ class TeamAEnv(gym.Env):
         """
         Reward shaping for team_a.
 
-          1. ALL players rewarded for proximity to ball  +0.1 each (max 6x per step)
-          2. Closest player bonus                        +0.3
-          3. Ball touch                                  +0.3
-          4. Pass completed                              +1.5
-          5. Support positioning (5-20u from ball)       +0.05 per player
-          6. Too-far penalty (>30u)                      -0.1  per player
-          7. Boundary penalty                            -0.15 per player
-          8. Goal scored / conceded                      +10 / -10
+          1. Closest player approaches ball             +0.3 (scaled by distance)
+          2. Ball touch                                 +0.5
+          3. Ball moving toward opponent goal (vx > 0) +0.3 per step
+          4. Pass completed                             +1.5
+          5. Clustering penalty (<3u from ball)         -0.2 per non-closest player
+          6. Too-far penalty (>30u)                     -0.1 per player
+          7. Boundary penalty                           -0.25 per player
+          8. Goal scored / conceded                     +10 / -10
         """
         pos      = self._env._pos        # (12,2)
         ball     = self._env._ball_pos   # (2,)
+        ball_vx  = self._env._ball_vel[0]
         reward   = goal_reward           # +10 / -10 on goals
 
         team_a = pos[:6]
@@ -78,46 +79,45 @@ class TeamAEnv(gym.Env):
         closest_i    = int(np.argmin(dists))
         closest_dist = dists[closest_i]
 
-        # ── 1. Only closest player chases ball ───────────────────────────────
-        # Others are rewarded for support spacing, NOT for clustering at the ball
+        # ── 1. Closest player chases ball ────────────────────────────────────
         reward += 0.3 * max(0.0, 1.0 - closest_dist / 20.0)
 
         # ── 2. Touch ──────────────────────────────────────────────────────────
         if closest_dist < KICK_RANGE:
-            reward += 0.3
-            self._last_toucher = closest_i   # remember who had it last
+            reward += 0.5
+            self._last_toucher = closest_i
 
-        # ── 3. Pass — fires when a DIFFERENT player picks up a loose ball ─────
-        # _last_toucher is NOT reset when the ball is loose, so a real kicked
-        # pass (ball rolls, second player picks it up) is correctly detected
+        # ── 3. Ball moving toward opponent goal ───────────────────────────────
+        # Main directional signal — breaks the orbiting symmetry
+        if ball_vx > 0:
+            reward += 0.3 * (ball_vx / 1.0)   # scaled by speed, max ~0.3
+
+        # ── 4. Pass — fires when a DIFFERENT player picks up a loose ball ─────
         if closest_dist < KICK_RANGE and \
            self._last_toucher is not None and \
            self._last_toucher != closest_i:
-            reward += 1.5   # pass completed
+            reward += 1.5
 
-        # ── 4. Support positions — spread out, be available for a pass ────────
+        # ── 5. Clustering penalty only — no orbiting reward ───────────────────
         for i in range(6):
             if i == closest_i:
                 continue
             d = dists[i]
-            if 5.0 < d < 20.0:
-                reward += 0.08   # good support position
-            elif d < 3.0:
+            if d < 3.0:
                 reward -= 0.2    # clustering — get out of the way
             elif d > 30.0:
                 reward -= 0.1    # too far away
 
-        # ── 7. Boundary penalty ───────────────────────────────────────────────
-        # Must be stronger than support reward (+0.08) so corners are never worth it
+        # ── 6. Boundary penalty ───────────────────────────────────────────────
         margin = 6.0
         for i in range(6):
             px, py = team_a[i]
             near_x = px < margin or px > FIELD_W - margin
             near_y = py < margin or py > FIELD_H - margin
             if near_x or near_y:
-                reward -= 0.25             # edge — clearly bad
+                reward -= 0.25
             if near_x and near_y:
-                reward -= 0.25             # corner — double penalty
+                reward -= 0.25
 
         return reward
 
@@ -151,11 +151,9 @@ if __name__ == "__main__":
 
     env = TeamAEnv(render_mode=None)
 
-    policy_kwargs = {"squash_output": True}
-
     if os.path.exists(f"{MODEL_NAME}.zip"):
         print(f"Found existing '{MODEL_NAME}.zip' — continuing training from checkpoint.")
-        model = PPO.load(MODEL_NAME, env=env, policy_kwargs=policy_kwargs)
+        model = PPO.load(MODEL_NAME, env=env)
         model.ent_coef = 0.003      # override saved value — reduce randomness
         model.learning_rate = 1e-4  # stabilize after reward scale change
     else:
@@ -167,11 +165,12 @@ if __name__ == "__main__":
             tensorboard_log=LOG_DIR,
             n_steps=2048,
             batch_size=64,
-            n_epochs=10,
+            n_epochs=5,
             learning_rate=1e-4,
             ent_coef=0.003,
             clip_range=0.2,
-            policy_kwargs=policy_kwargs,
+            use_sde=True,
+            policy_kwargs={"squash_output": True},
         )
 
     checkpoint_cb = CheckpointCallback(
