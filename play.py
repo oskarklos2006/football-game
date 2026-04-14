@@ -8,7 +8,7 @@ obs, _ = env.reset(seed=42)
 env.render()
 
 # Load team_a model if it exists, otherwise play randomly
-if os.path.exists("team_a.zip"):
+if os.path.exists("team_a_2.zip"):
     model = PPO.load("team_a")
     print("Loaded trained team_a model.")
 else:
