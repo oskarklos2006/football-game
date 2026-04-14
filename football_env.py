@@ -23,8 +23,8 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 
 PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
-MAX_SPEED     = 1.3       
-KICK_POWER    = 1.0
+MAX_SPEED     = 1.0
+KICK_POWER    = 0.8
 FRICTION      = 0.93
 MAX_STEPS     = 1000
 
@@ -101,8 +101,9 @@ class SoccerEnv(gym.Env):
         default_rewards = dict(
             goal_scored   =  10.0,
             goal_conceded = -10.0,
-            ball_to_goal  =   0.1,
-            touch_ball    =   0.05,
+            ball_to_goal  =   1.0,    # delta multiplier: reward for moving ball toward goal
+            move_cost     =  -0.001,  # small penalty per unit of team speed (reduces sprinting)
+            spread        =   0.0001, # reward mean pairwise distance between teammates
         )
         self.reward_cfg = {**default_rewards, **(reward_cfg or {})}
 
@@ -125,6 +126,7 @@ class SoccerEnv(gym.Env):
         self._vel      = np.zeros((N_PLAYERS, 2), dtype=np.float32)
         self._ball_pos = np.zeros(2, dtype=np.float32)
         self._ball_vel = np.zeros(2, dtype=np.float32)
+        self._prev_ball_x = FIELD_W / 2
         self._step_count = 0
         self._score = [0, 0]
         self._renderer = None
@@ -157,6 +159,7 @@ class SoccerEnv(gym.Env):
         self._vel[:] = 0
         self._ball_pos = np.array([cx, cy], dtype=np.float32)
         self._ball_vel = np.zeros(2, dtype=np.float32)
+        self._prev_ball_x = cx  # reset reference so no delta spike after a goal
 
     def step(self, actions):
         a_act = np.clip(actions["team_a"], -1, 1)
@@ -246,18 +249,35 @@ class SoccerEnv(gym.Env):
     def _compute_rewards(self):
         r = self.reward_cfg
         bx = self._ball_pos[0]
-        reward_a = r["ball_to_goal"] * (bx / FIELD_W)
-        reward_b = r["ball_to_goal"] * (1.0 - bx / FIELD_W)
 
-        kick_range = PLAYER_RADIUS + BALL_RADIUS + 0.5
-        for i in range(6):
-            if np.linalg.norm(self._ball_pos - self._pos[i]) < kick_range:
-                reward_a += r["touch_ball"]
-        for i in range(6, 12):
-            if np.linalg.norm(self._ball_pos - self._pos[i]) < kick_range:
-                reward_b += r["touch_ball"]
+        # Delta reward: only reward actual progress toward the opponent's goal
+        delta_x = bx - self._prev_ball_x
+        reward_a =  r["ball_to_goal"] * (delta_x / FIELD_W)
+        reward_b = -r["ball_to_goal"] * (delta_x / FIELD_W)
+        self._prev_ball_x = bx
+
+        # Movement cost — small penalty for sprinting, encourages deliberate movement
+        speed_a = float(np.sum(np.linalg.norm(self._vel[:6], axis=1)))
+        speed_b = float(np.sum(np.linalg.norm(self._vel[6:], axis=1)))
+        reward_a += r["move_cost"] * speed_a
+        reward_b += r["move_cost"] * speed_b
+
+        # Spread reward — reward mean pairwise distance between teammates
+        # A player staying wide earns more for this than one crowding the ball
+        reward_a += r["spread"] * self._team_spread(self._pos[:6])
+        reward_b += r["spread"] * self._team_spread(self._pos[6:])
 
         return reward_a, reward_b
+
+    @staticmethod
+    def _team_spread(positions: np.ndarray) -> float:
+        """Mean pairwise distance between the 6 players in a team."""
+        n = len(positions)
+        total = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                total += float(np.linalg.norm(positions[i] - positions[j]))
+        return total / (n * (n - 1) / 2)
 
     def _check_goal(self):
         bx, by = self._ball_pos

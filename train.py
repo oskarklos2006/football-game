@@ -32,6 +32,8 @@ class TeamAEnv(gym.Env):
         self._env = SoccerEnv(render_mode=render_mode, reward_cfg={
             "ball_to_goal": 0.0,
             "touch_ball":   0.0,
+            "move_cost":    0.0,
+            "spread":       0.0,
         })
         self._opponent  = opponent_model
         self._last_obs_b        = None
@@ -60,12 +62,12 @@ class TeamAEnv(gym.Env):
         Reward shaping for team_a.
 
           1. Closest player approaches ball             +0.3 (scaled by distance)
-          2. Ball touch                                 +0.5
-          3. Ball moving toward opponent goal (vx > 0) +0.3 per step
-          4. Pass completed                             +1.5
+          2. Ball moving toward opponent goal (vx > 0) +0.3 per step
+          3. Pass completed (different player picks up) +1.5
+          4. Team spread reward (mean pairwise dist)    +0.0001 per unit
           5. Clustering penalty (<3u from ball)         -0.2 per non-closest player
-          6. Too-far penalty (>30u)                     -0.1 per player
-          7. Boundary penalty                           -0.25 per player
+          6. Too-far penalty (>30u from ball)           -0.1 per player
+          7. Own-goal-area / corner penalty             -0.25 per player
           8. Goal scored / conceded                     +10 / -10
         """
         pos      = self._env._pos        # (12,2)
@@ -79,44 +81,51 @@ class TeamAEnv(gym.Env):
         closest_i    = int(np.argmin(dists))
         closest_dist = dists[closest_i]
 
-        # ── 1. Closest player chases ball ────────────────────────────────────
+        # ── 1. Closest player chases ball ─────────────────────────────────────
         reward += 0.3 * max(0.0, 1.0 - closest_dist / 20.0)
 
-        # ── 2. Touch ──────────────────────────────────────────────────────────
-        if closest_dist < KICK_RANGE:
-            reward += 0.5
-            self._last_toucher = closest_i
-
-        # ── 3. Ball moving toward opponent goal ───────────────────────────────
-        # Main directional signal — breaks the orbiting symmetry
+        # ── 2. Ball moving toward opponent goal ───────────────────────────────
         if ball_vx > 0:
             reward += 0.3 * (ball_vx / 1.0)   # scaled by speed, max ~0.3
 
-        # ── 4. Pass — fires when a DIFFERENT player picks up a loose ball ─────
+        # ── 3. Pass — fires when a DIFFERENT player picks up the ball ─────────
+        # Check BEFORE updating last_toucher so the comparison is to the previous holder
         if closest_dist < KICK_RANGE and \
            self._last_toucher is not None and \
            self._last_toucher != closest_i:
             reward += 1.5
+        if closest_dist < KICK_RANGE:
+            self._last_toucher = closest_i
 
-        # ── 5. Clustering penalty only — no orbiting reward ───────────────────
+        # ── 4. Spread reward — incentivises wide play and positioning ──────────
+        # Right winger earns more reward staying wide than crowding the ball.
+        # Mean pairwise distance ~20-25u when spread, ~2-3u when crowded.
+        n = 6
+        spread_sum = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                spread_sum += float(np.linalg.norm(team_a[i] - team_a[j]))
+        reward += 0.0001 * spread_sum / (n * (n - 1) / 2)
+
+        # ── 5. Clustering penalty — push non-closest players away from ball ────
         for i in range(6):
             if i == closest_i:
                 continue
             d = dists[i]
             if d < 3.0:
-                reward -= 0.2    # clustering — get out of the way
+                reward -= 0.2    # too close — get out of the way
             elif d > 30.0:
-                reward -= 0.1    # too far away
+                reward -= 0.1    # too far to contribute
 
-        # ── 6. Boundary penalty ───────────────────────────────────────────────
-        margin = 6.0
+        # ── 6. Boundary penalty — own goal area and corners only ──────────────
+        # No y-side penalty: wingers are supposed to play wide near the sidelines.
+        # Player 0 is the GK — exempt from own-goal penalty, it belongs there.
         for i in range(6):
             px, py = team_a[i]
-            near_x = px < margin or px > FIELD_W - margin
-            near_y = py < margin or py > FIELD_H - margin
-            if near_x or near_y:
-                reward -= 0.25
-            if near_x and near_y:
+            if i != 0 and px < 4.0:                         # non-GK camping own goal
+                reward -= 0.3
+            if (px < 4.0 or px > FIELD_W - 4.0) and \
+               (py < 4.0 or py > FIELD_H - 4.0):           # corner camping
                 reward -= 0.25
 
         return reward
@@ -143,7 +152,7 @@ class TeamAEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    TOTAL_STEPS    = 500_000
+    TOTAL_STEPS    = 1_000_000
     SAVE_EVERY     = 50_000
     MODEL_NAME     = "team_a"
     LOG_DIR        = "./logs/"
