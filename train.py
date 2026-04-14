@@ -112,7 +112,7 @@ class TeamAEnv(gym.Env):
             if i == closest_i:
                 continue
             d = dists[i]
-            if d < 3.0:
+            if d < 6.0:
                 reward -= 0.2    # too close — get out of the way
             elif d > 30.0:
                 reward -= 0.1    # too far to contribute
