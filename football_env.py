@@ -24,8 +24,8 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
 MAX_SPEED     = 1.0
-KICK_POWER    = 0.8
-FRICTION      = 0.93
+KICK_POWER    = 1.8
+FRICTION      = 0.9
 MAX_STEPS     = 1000
 
 N_PLAYERS = 12            # 6 per team
@@ -36,10 +36,13 @@ def _obs_for_team(agent_positions, agent_velocities, ball_pos, ball_vel,
                   team_idx: int) -> np.ndarray:
     """
     Flat observation vector for the whole team (all values in [-1, 1]):
-      own_player_0..5  x, y, vx, vy   (6x4 = 24)
-      opp_player_0..5  x, y, vx, vy   (6x4 = 24)
-      ball             x, y, vx, vy   (4)
-      total: 52 floats
+      own_player_0..5  x, y, vx, vy, role_id   (6x5 = 30)
+      opp_player_0..5  x, y, vx, vy             (6x4 = 24)
+      ball             x, y, vx, vy             (4)
+      total: 58 floats
+
+    role_id is the player's index within the team normalised to [0, 1].
+    It lets the shared policy learn role-specific behaviour (GK vs forward).
     """
     if team_idx == 0:
         own = [0, 1, 2, 3, 4, 5]
@@ -59,7 +62,11 @@ def _obs_for_team(agent_positions, agent_velocities, ball_pos, ball_vel,
         )
 
     obs = []
-    for i in own + opp:
+    for role_idx, i in enumerate(own):
+        obs.append(norm_pos(agent_positions[i]))
+        obs.append(norm_vel(agent_velocities[i]))
+        obs.append(np.array([role_idx / 5.0], dtype=np.float32))
+    for i in opp:
         obs.append(norm_pos(agent_positions[i]))
         obs.append(norm_vel(agent_velocities[i]))
     obs.append(norm_pos(ball_pos))
@@ -69,7 +76,7 @@ def _obs_for_team(agent_positions, agent_velocities, ball_pos, ball_vel,
         -1, 1
     )
     obs.append(ball_vel_norm)
-    return np.concatenate(obs)   
+    return np.concatenate(obs)
 
 
 # Environment
@@ -116,7 +123,7 @@ class SoccerEnv(gym.Env):
             "team_b": team_action,
         })
 
-        single_obs = spaces.Box(low=-1, high=1, shape=(52,), dtype=np.float32)
+        single_obs = spaces.Box(low=-1, high=1, shape=(58,), dtype=np.float32)
         self.observation_space = spaces.Dict({
             "team_a": single_obs,
             "team_b": single_obs,
