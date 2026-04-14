@@ -151,9 +151,11 @@ if __name__ == "__main__":
 
     env = TeamAEnv(render_mode=None)
 
+    policy_kwargs = {"squash_output": True}
+
     if os.path.exists(f"{MODEL_NAME}.zip"):
         print(f"Found existing '{MODEL_NAME}.zip' — continuing training from checkpoint.")
-        model = PPO.load(MODEL_NAME, env=env)
+        model = PPO.load(MODEL_NAME, env=env, policy_kwargs=policy_kwargs)
         model.ent_coef = 0.003      # override saved value — reduce randomness
         model.learning_rate = 1e-4  # stabilize after reward scale change
     else:
@@ -169,6 +171,7 @@ if __name__ == "__main__":
             learning_rate=1e-4,
             ent_coef=0.003,
             clip_range=0.2,
+            policy_kwargs=policy_kwargs,
         )
 
     checkpoint_cb = CheckpointCallback(
