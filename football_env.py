@@ -13,7 +13,7 @@ PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
 MAX_SPEED     = 1.0
 KICK_POWER    = 1.3
-FRICTION      = 0.92
+FRICTION      = 0.94
 MAX_STEPS     = 1000
 
 
@@ -46,8 +46,8 @@ class SoccerEnv(gym.Env):
         self.render_mode = render_mode
         self.n = n_players
 
-        # action per team: (n_players, 3) — move_x, move_y, kick
-        team_action = spaces.Box(low=-1.0, high=1.0, shape=(n_players, 3), dtype=np.float32)
+        # action per team: (n_players, 2) — move_x, move_y
+        team_action = spaces.Box(low=-1.0, high=1.0, shape=(n_players, 2), dtype=np.float32)
         self.action_space = spaces.Dict({"team_a": team_action, "team_b": team_action})
 
         obs_size = n_players * 4 * 2 + 4  # own + opp (n*4 each) + ball (4)
@@ -96,19 +96,16 @@ class SoccerEnv(gym.Env):
                                    [PLAYER_RADIUS, PLAYER_RADIUS],
                                    [FIELD_W - PLAYER_RADIUS, FIELD_H - PLAYER_RADIUS])
 
-        # --- kick: closest player requesting a kick wins ---
-        kick_range = PLAYER_RADIUS + BALL_RADIUS + 0.5
-        best_i, best_d = -1, kick_range
+        # --- push: player transfers velocity to ball on contact ---
+        PUSH_FACTOR = 1.8
         for i in range(N):
-            if all_act[i, 2] > 0:
-                d = np.linalg.norm(self._ball_pos - self._pos[i])
-                if d < best_d:
-                    best_d, best_i = d, i
-        if best_i >= 0:
-            diff = self._ball_pos - self._pos[best_i]
+            diff = self._ball_pos - self._pos[i]
             d = np.linalg.norm(diff)
-            if d > 1e-6:
-                self._ball_vel = diff / d * KICK_POWER * all_act[best_i, 2]
+            min_d = PLAYER_RADIUS + BALL_RADIUS
+            if 1e-6 < d < min_d:
+                normal = diff / d
+                self._ball_pos = self._pos[i] + normal * min_d
+                self._ball_vel = self._vel[i] * PUSH_FACTOR
 
         # --- ball physics: move, friction, wall bounces, player separation ---
         self._ball_pos += self._ball_vel
