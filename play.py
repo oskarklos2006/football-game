@@ -3,17 +3,21 @@ import pygame
 from stable_baselines3 import PPO
 from football_env import SoccerEnv
 
-env = SoccerEnv(render_mode="human")
+env = SoccerEnv(render_mode="human", n_players=1)
 obs, _ = env.reset(seed=42)
 env.render()
 
-# Load team_a model if it exists, otherwise play randomly
-if os.path.exists("team_a_2.zip"):
+if os.path.exists("team_a.zip"):
     model = PPO.load("team_a")
-    print("Loaded trained team_a model.")
+    expected = env.observation_space["team_a"].shape
+    if model.observation_space.shape != expected:
+        print(f"Model obs shape {model.observation_space.shape} != env {expected} — ignoring, playing randomly.")
+        model = None
+    else:
+        print("Loaded trained model.")
 else:
     model = None
-    print("No trained model found — both teams play randomly.")
+    print("No model found — both teams play randomly.")
 
 running = True
 while running:
@@ -28,16 +32,14 @@ while running:
     else:
         action_a = env.action_space["team_a"].sample()
 
-    actions = {
+    obs, _, terminated, truncated, info = env.step({
         "team_a": action_a,
         "team_b": env.action_space["team_b"].sample(),
-    }
-
-    obs, rewards, terminated, truncated, info = env.step(actions)
+    })
     env.render()
 
     if truncated or terminated:
-        print(f"Final score — A (you): {info['score'][0]}  B (random): {info['score'][1]}")
+        print(f"Final score — A: {info['score'][0]}  B: {info['score'][1]}")
         obs, _ = env.reset()
 
 env.close()
