@@ -12,8 +12,8 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 PLAYER_RADIUS = 1.3
 BALL_RADIUS   = 0.8
 MAX_SPEED     = 1.0
-KICK_POWER    = 1.3
-FRICTION      = 0.94
+KICK_POWER    = 1.6
+FRICTION      = 0.70
 MAX_STEPS     = 1000
 
 
@@ -67,7 +67,7 @@ class SoccerEnv(gym.Env):
         super().reset(seed=seed)
         self._reset_positions()
         self._step_count = 0
-        return self._get_obs(), {}
+        return self._get_obs(), {"ball_pos": self._ball_pos.copy()}
 
     def _reset_positions(self):
         cx, cy = FIELD_W / 2, FIELD_H / 2
@@ -96,8 +96,7 @@ class SoccerEnv(gym.Env):
                                    [PLAYER_RADIUS, PLAYER_RADIUS],
                                    [FIELD_W - PLAYER_RADIUS, FIELD_H - PLAYER_RADIUS])
 
-        # --- push: player transfers velocity to ball on contact ---
-        PUSH_FACTOR = 1.8
+        # --- kick: fixed impulse away from player on contact ---
         for i in range(N):
             diff = self._ball_pos - self._pos[i]
             d = np.linalg.norm(diff)
@@ -105,7 +104,9 @@ class SoccerEnv(gym.Env):
             if 1e-6 < d < min_d:
                 normal = diff / d
                 self._ball_pos = self._pos[i] + normal * min_d
-                self._ball_vel = self._vel[i] * PUSH_FACTOR
+                # only apply kick if ball isn't already moving away faster
+                if np.dot(self._ball_vel, normal) < KICK_POWER:
+                    self._ball_vel = normal * KICK_POWER
 
         # --- ball physics: move, friction, wall bounces, player separation ---
         self._ball_pos += self._ball_vel
@@ -138,7 +139,10 @@ class SoccerEnv(gym.Env):
 
         self._step_count += 1
         truncated = self._step_count >= MAX_STEPS
-        return self._get_obs(), {"team_a": ra, "team_b": rb}, False, truncated, {"score": list(self._score)}
+        return self._get_obs(), {"team_a": ra, "team_b": rb}, False, truncated, {
+            "score":    list(self._score),
+            "ball_pos": self._ball_pos.copy(),
+        }
 
     def _check_goal(self):
         bx, by = self._ball_pos
