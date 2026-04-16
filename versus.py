@@ -11,8 +11,8 @@ from train import get_relative_obs
 # ==========================================
 # SET YOUR MODELS HERE
 # ==========================================
-TEAM_A_PATH = "best_round_2"  # Your new pro
-TEAM_B_PATH = "best_round_5"  # The old boss
+TEAM_A_PATH = "basic_correct_weights"  # Your new pro
+TEAM_B_PATH = "best_model_a"  # The old boss
 # ==========================================
 
 N_EPISODES = 10
