@@ -19,6 +19,95 @@ MAX_STEPS     = 1000
 FRICTION   = 0.92
 KICK_POWER = 1.2
 INERTIA    = 0.75
+CORNER_R   = 4.0   # visual/physics corner radius — safe for any value >= 0
+
+
+# ---------------------------------------------------------------------------
+# Rounded rectangle boundary helpers
+# ---------------------------------------------------------------------------
+def _resolve_ball_boundary(ball_pos, ball_vel, r=BALL_RADIUS):
+    """
+    Constrains ball inside a rounded-rectangle field.
+    Uses effective corner radius = max(CORNER_R, r) so it's safe for any CORNER_R.
+    """
+    pos = ball_pos.copy()
+    vel = ball_vel.copy()
+    cr  = max(CORNER_R, r + 0.01)   # ensure arc limit is always positive
+
+    in_left   = pos[0] < cr
+    in_right  = pos[0] > FIELD_W - cr
+    in_top    = pos[1] < cr
+    in_bottom = pos[1] > FIELD_H - cr
+
+    if (in_left or in_right) and (in_top or in_bottom):
+        cx = cr if in_left else FIELD_W - cr
+        cy = cr if in_top  else FIELD_H - cr
+        to_ball = pos - np.array([cx, cy])
+        dist    = np.linalg.norm(to_ball)
+        limit   = cr - r
+        if dist > limit and dist > 1e-6:
+            normal = to_ball / dist
+            pos    = np.array([cx, cy]) + normal * limit
+            vel   -= 2 * np.dot(vel, normal) * normal
+        elif dist <= 1e-6:
+            # Ball exactly on arc center — push toward field center
+            to_center = np.array([FIELD_W / 2, FIELD_H / 2]) - pos
+            n = to_center / (np.linalg.norm(to_center) + 1e-8)
+            pos += n * limit
+            vel  = n * np.linalg.norm(vel)
+    else:
+        if pos[0] < r:
+            pos[0] = r
+            vel[0] = abs(vel[0])
+        elif pos[0] > FIELD_W - r:
+            pos[0] = FIELD_W - r
+            vel[0] = -abs(vel[0])
+
+        if pos[1] < r:
+            pos[1] = r
+            vel[1] = abs(vel[1])
+        elif pos[1] > FIELD_H - r:
+            pos[1] = FIELD_H - r
+            vel[1] = -abs(vel[1])
+
+    return pos, vel
+
+
+def _resolve_player_boundary(pos, vel):
+    """
+    Constrains a player inside the rounded-rectangle field.
+    Uses effective corner radius = max(CORNER_R, PLAYER_RADIUS + 0.01).
+    """
+    cr    = max(CORNER_R, PLAYER_RADIUS + 0.01)
+    r     = PLAYER_RADIUS
+    p     = pos.copy()
+    v     = vel.copy()
+
+    in_left   = p[0] < cr + r
+    in_right  = p[0] > FIELD_W - cr - r
+    in_top    = p[1] < cr + r
+    in_bottom = p[1] > FIELD_H - cr - r
+
+    if (in_left or in_right) and (in_top or in_bottom):
+        cx = cr if (p[0] < FIELD_W / 2) else FIELD_W - cr
+        cy = cr if (p[1] < FIELD_H / 2) else FIELD_H - cr
+        to_player = p - np.array([cx, cy])
+        dist      = np.linalg.norm(to_player)
+        limit     = cr - r
+        if limit > 0 and dist < limit and dist > 1e-6:
+            p = np.array([cx, cy]) + (to_player / dist) * limit
+            normal = to_player / dist
+            if np.dot(v, normal) < 0:
+                v -= np.dot(v, normal) * normal
+        elif dist <= 1e-6:
+            # Push away from corner center toward field center
+            to_center = np.array([FIELD_W / 2, FIELD_H / 2]) - p
+            n = to_center / (np.linalg.norm(to_center) + 1e-8)
+            p += n * max(limit, 0.1)
+
+    # Always clamp to straight walls as fallback
+    p = np.clip(p, [r, r], [FIELD_W - r, FIELD_H - r])
+    return p, v
 
 
 # ---------------------------------------------------------------------------
@@ -51,23 +140,6 @@ def _make_obs(positions, velocities, ball_pos, ball_vel, team_idx, n):
 # Main environment
 # ---------------------------------------------------------------------------
 class SoccerEnv(gym.Env):
-    """
-    2-team soccer environment.
-
-    Physics:
-      - Momentum-based kick: ball receives base_impulse + player_momentum.
-        Sprint direction matters; agent can aim by choosing approach angle.
-      - FRICTION = 0.92: ball travels realistically far across the field.
-      - KICK_POWER = 1.2: balanced against higher friction.
-      - Single collision pass: kick and separation are merged into one loop
-        per player so the separation push cannot cancel a just-applied kick.
-      - GOAL_CENTER for reward calculations uses FIELD_W - BALL_RADIUS,
-        matching the actual goal trigger boundary exactly.
-
-    Reward API:
-      step() returns raw ±1 for goal/concede in the rewards dict.
-      All shaping is done in the wrapper (train.py).
-    """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     def __init__(self, render_mode=None, n_players=1):
@@ -103,17 +175,13 @@ class SoccerEnv(gym.Env):
 
     def _reset_positions(self, options=None):
         n = self.n
-        # Define the 'safe' area for spawning (avoiding the very edge of the walls)
         margin = PLAYER_RADIUS + 2.0
 
         for i in range(n):
-            # Team A: Randomly spawn on the LEFT half (x: margin to FIELD_W/2)
             self._pos[i] = [
                 self.np_random.uniform(margin, FIELD_W / 2 - 2.0),
                 self.np_random.uniform(margin, FIELD_H - margin)
             ]
-
-            # Team B: Randomly spawn on the RIGHT half (x: FIELD_W/2 to FIELD_W - margin)
             self._pos[n + i] = [
                 self.np_random.uniform(FIELD_W / 2 + 2.0, FIELD_W - margin),
                 self.np_random.uniform(margin, FIELD_H - margin)
@@ -146,54 +214,59 @@ class SoccerEnv(gym.Env):
                 move = move / spd
             self._vel[i] = (INERTIA * self._vel[i]
                             + (1 - INERTIA) * move * MAX_SPEED)
-            self._pos[i] = np.clip(
-                self._pos[i] + self._vel[i],
-                [PLAYER_RADIUS, PLAYER_RADIUS],
-                [FIELD_W - PLAYER_RADIUS, FIELD_H - PLAYER_RADIUS]
+            self._pos[i] += self._vel[i]
+            self._pos[i], self._vel[i] = _resolve_player_boundary(
+                self._pos[i], self._vel[i]
             )
 
-        # --- single collision pass: kick + separation merged ---
-        #
-        # FIX vs original: previously there were two separate loops —
-        # one for kicking, one for separation. The second loop could push
-        # the ball back into a wall after the kick, cancelling the impulse.
-        # Now each player is handled atomically: if overlapping, apply
-        # momentum kick AND resolve separation in the same pass.
-        # The second post-ball-physics separation loop is removed entirely.
-        #
-        # Kick model: base_push (away from player) + player momentum transfer.
-        # Only applied when the new velocity adds speed in the away direction,
-        # preventing a stationary player from killing a moving ball.
+        # --- player-player separation ---
         for i in range(N):
-            diff = self._ball_pos - self._pos[i]
-            d    = np.linalg.norm(diff)
-            min_d = PLAYER_RADIUS + BALL_RADIUS
-            if 1e-6 < d < min_d:
-                normal = diff / d
-
-                # Separate first so ball is exactly at contact boundary
-                self._ball_pos = self._pos[i] + normal * min_d
-
-                # Apply momentum-based kick
-                base_push = normal * KICK_POWER * 0.6
-                momentum  = self._vel[i] * 0.8
-                new_vel   = base_push + momentum
-
-                if np.dot(new_vel - self._ball_vel, normal) > 0:
-                    self._ball_vel = new_vel
+            for j in range(i + 1, N):
+                diff = self._pos[i] - self._pos[j]
+                dist = np.linalg.norm(diff)
+                min_dist = PLAYER_RADIUS * 2
+                if dist < min_dist and dist > 1e-6:
+                    normal  = diff / dist
+                    overlap = (min_dist - dist) / 2
+                    self._pos[i] = np.clip(
+                        self._pos[i] + normal * overlap,
+                        [PLAYER_RADIUS, PLAYER_RADIUS],
+                        [FIELD_W - PLAYER_RADIUS, FIELD_H - PLAYER_RADIUS]
+                    )
+                    self._pos[j] = np.clip(
+                        self._pos[j] - normal * overlap,
+                        [PLAYER_RADIUS, PLAYER_RADIUS],
+                        [FIELD_W - PLAYER_RADIUS, FIELD_H - PLAYER_RADIUS]
+                    )
+                    rel_vel = self._vel[i] - self._vel[j]
+                    if np.dot(rel_vel, normal) < 0:
+                        impulse = np.dot(rel_vel, normal) * normal * 0.5
+                        self._vel[i] -= impulse
+                        self._vel[j] += impulse
 
         # --- ball physics ---
         self._ball_pos += self._ball_vel
         self._ball_vel *= FRICTION
 
-        # Wall bounces — applied after movement so ball never clips through
-        for axis, limit in [(0, FIELD_W), (1, FIELD_H)]:
-            if self._ball_pos[axis] <= BALL_RADIUS:
-                self._ball_pos[axis] = BALL_RADIUS
-                self._ball_vel[axis] = abs(self._ball_vel[axis])
-            elif self._ball_pos[axis] >= limit - BALL_RADIUS:
-                self._ball_pos[axis] = limit - BALL_RADIUS
-                self._ball_vel[axis] = -abs(self._ball_vel[axis])
+        # --- collision pass: 3 iterations so ball can't stay wedged ---
+        for _ in range(3):
+            for i in range(N):
+                diff = self._ball_pos - self._pos[i]
+                d    = np.linalg.norm(diff)
+                min_d = PLAYER_RADIUS + BALL_RADIUS
+                if 1e-6 < d < min_d:
+                    normal = diff / d
+                    self._ball_pos = self._pos[i] + normal * min_d
+                    base_push = normal * KICK_POWER * 0.6
+                    momentum  = self._vel[i] * 0.8
+                    new_vel   = base_push + momentum
+                    if np.dot(new_vel - self._ball_vel, normal) > 0:
+                        self._ball_vel = new_vel
+
+        # --- rounded rectangle boundary ---
+        self._ball_pos, self._ball_vel = _resolve_ball_boundary(
+            self._ball_pos, self._ball_vel, BALL_RADIUS
+        )
 
         # --- goal check ---
         ra, rb = 0.0, 0.0
@@ -303,26 +376,43 @@ class SoccerEnv(gym.Env):
         pygame.draw.rect(surf, GOAL_NET, (GD + W, gy0, GD, gh))
         pygame.draw.rect(surf, WHITE,    (GD + W, gy0, GD, gh), 2)
 
+        # --- grass with rounded corners using alpha mask ---
+        CR = int(max(CORNER_R, 1) * SCALE)
+        grass_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        grass_surf.fill((0, 0, 0, 0))
         stripe_w = W // 10
         for s in range(10):
             col = (40, 130, 40) if s % 2 == 0 else (50, 160, 50)
-            pygame.draw.rect(surf, col, (GD + s * stripe_w, MB, stripe_w, H))
+            pygame.draw.rect(grass_surf, col, (s * stripe_w, 0, stripe_w, H))
+        mask_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        mask_surf.fill((0, 0, 0, 0))
+        pygame.draw.rect(mask_surf, (255, 255, 255, 255),
+                         pygame.Rect(0, 0, W, H), border_radius=CR)
+        grass_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+        surf.blit(grass_surf, (GD, MB))
 
-        pygame.draw.rect(surf, WHITE, (GD, MB, W, H), 2)
-        pygame.draw.line(surf, WHITE, (GD, gy0), (GD, gy1), 3)
+        # --- rounded field border ---
+        field_rect = pygame.Rect(GD, MB, W, H)
+        pygame.draw.rect(surf, WHITE, field_rect, 2, border_radius=CR)
+
+        # --- goal lines ---
+        pygame.draw.line(surf, WHITE, (GD,     gy0), (GD,     gy1), 3)
         pygame.draw.line(surf, WHITE, (GD + W, gy0), (GD + W, gy1), 3)
-        pygame.draw.line(surf, WHITE, (GD + W // 2, MB), (GD + W // 2, MB + H), 2)
 
+        # --- centre line + circle ---
+        pygame.draw.line(surf, WHITE, (GD + W // 2, MB), (GD + W // 2, MB + H), 2)
         cx_px, cy_px = GD + W // 2, MB + H // 2
         pygame.draw.circle(surf, WHITE, (cx_px, cy_px), int(6 * SCALE), 2)
         pygame.draw.circle(surf, WHITE, (cx_px, cy_px), 3)
 
+        # --- penalty areas ---
         pa_w = int(8 * SCALE)
         pa_h = int(16 * SCALE)
         pa_y = MB + (H - pa_h) // 2
-        pygame.draw.rect(surf, WHITE, (GD, pa_y, pa_w, pa_h), 2)
+        pygame.draw.rect(surf, WHITE, (GD,            pa_y, pa_w, pa_h), 2)
         pygame.draw.rect(surf, WHITE, (GD + W - pa_w, pa_y, pa_w, pa_h), 2)
 
+        # --- players ---
         TEAM_A, TEAM_B = (30, 100, 220), (220, 50, 50)
         pr = int(PLAYER_RADIUS * SCALE)
         for i in range(2 * self.n):
@@ -335,12 +425,14 @@ class SoccerEnv(gym.Env):
             surf.blit(lbl, (px - lbl.get_width() // 2,
                             py - lbl.get_height() // 2))
 
+        # --- ball ---
         bx = GD + int(self._ball_pos[0] * SCALE)
         by = MB + int(self._ball_pos[1] * SCALE)
         br = int(BALL_RADIUS * SCALE)
         pygame.draw.circle(surf, (240, 240, 240), (bx, by), br)
         pygame.draw.circle(surf, (30, 30, 30), (bx, by), br, 1)
 
+        # --- scoreboard ---
         stxt = self._sfont.render(
             f"  A  {self._score[0]} : {self._score[1]}  B  ",
             True, (220, 220, 220), (20, 20, 20)
