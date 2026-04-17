@@ -121,12 +121,13 @@ class SoccerEnv(gym.Env):
 
         self._vel[:] = 0
 
-        # Curriculum support: caller can override ball start position
         if options is not None and "ball_pos" in options:
             self._ball_pos[:] = options["ball_pos"]
         else:
-            # You can also make the ball start slightly random if you want!
-            self._ball_pos[:] = [FIELD_W / 2, FIELD_H / 2]
+            self._ball_pos[:] = [
+                self.np_random.uniform(margin, FIELD_W - margin),
+                self.np_random.uniform(margin, FIELD_H - margin)
+            ]
 
         self._ball_vel[:] = 0
 
