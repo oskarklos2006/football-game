@@ -6,13 +6,13 @@ from stable_baselines3 import PPO
 from football_env import SoccerEnv, FIELD_W
 
 # Import the GPS logic from your train script
-from train import get_relative_obs
+from train_attacker import get_relative_obs
 
 # ==========================================
 # SET YOUR MODELS HERE
 # ==========================================
 TEAM_A_PATH = "basic_correct_weights"  # Your new pro
-TEAM_B_PATH = "best_model_a"  # The old boss
+TEAM_B_PATH = "best_attacker"  # The old boss
 # ==========================================
 
 N_EPISODES = 10

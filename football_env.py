@@ -26,86 +26,66 @@ CORNER_R   = 4.0   # visual/physics corner radius — safe for any value >= 0
 # Rounded rectangle boundary helpers
 # ---------------------------------------------------------------------------
 def _resolve_ball_boundary(ball_pos, ball_vel, r=BALL_RADIUS):
-    """
-    Constrains ball inside a rounded-rectangle field.
-    Uses effective corner radius = max(CORNER_R, r) so it's safe for any CORNER_R.
-    """
     pos = ball_pos.copy()
     vel = ball_vel.copy()
-    cr  = max(CORNER_R, r + 0.01)   # ensure arc limit is always positive
+    cr = max(CORNER_R, r + 0.1)
+    limit = cr - r
 
-    in_left   = pos[0] < cr
-    in_right  = pos[0] > FIELD_W - cr
-    in_top    = pos[1] < cr
-    in_bottom = pos[1] > FIELD_H - cr
+    # Determine which corner we might be in
+    kx = 1 if pos[0] < cr else (-1 if pos[0] > FIELD_W - cr else 0)
+    ky = 1 if pos[1] < cr else (-1 if pos[1] > FIELD_H - cr else 0)
 
-    if (in_left or in_right) and (in_top or in_bottom):
-        cx = cr if in_left else FIELD_W - cr
-        cy = cr if in_top  else FIELD_H - cr
-        to_ball = pos - np.array([cx, cy])
-        dist    = np.linalg.norm(to_ball)
-        limit   = cr - r
-        if dist > limit and dist > 1e-6:
-            normal = to_ball / dist
-            pos    = np.array([cx, cy]) + normal * limit
-            vel   -= 2 * np.dot(vel, normal) * normal
-        elif dist <= 1e-6:
-            # Ball exactly on arc center — push toward field center
-            to_center = np.array([FIELD_W / 2, FIELD_H / 2]) - pos
-            n = to_center / (np.linalg.norm(to_center) + 1e-8)
-            pos += n * limit
-            vel  = n * np.linalg.norm(vel)
+    if kx != 0 and ky != 0:
+        cx = cr if kx == 1 else FIELD_W - cr
+        cy = cr if ky == 1 else FIELD_H - cr
+        center = np.array([cx, cy])
+        to_ball = pos - center
+        dist = np.linalg.norm(to_ball)
+
+        if dist > limit:
+            normal = to_ball / (dist + 1e-8)
+            pos = center + normal * limit
+            # Reflect velocity
+            vel -= 2 * np.dot(vel, normal) * normal
     else:
+        # Standard wall bounces
         if pos[0] < r:
-            pos[0] = r
-            vel[0] = abs(vel[0])
+            pos[0] = r; vel[0] = abs(vel[0])
         elif pos[0] > FIELD_W - r:
-            pos[0] = FIELD_W - r
-            vel[0] = -abs(vel[0])
-
+            pos[0] = FIELD_W - r; vel[0] = -abs(vel[0])
         if pos[1] < r:
-            pos[1] = r
-            vel[1] = abs(vel[1])
+            pos[1] = r; vel[1] = abs(vel[1])
         elif pos[1] > FIELD_H - r:
-            pos[1] = FIELD_H - r
-            vel[1] = -abs(vel[1])
+            pos[1] = FIELD_H - r; vel[1] = -abs(vel[1])
 
     return pos, vel
 
 
 def _resolve_player_boundary(pos, vel):
-    """
-    Constrains a player inside the rounded-rectangle field.
-    Uses effective corner radius = max(CORNER_R, PLAYER_RADIUS + 0.01).
-    """
-    cr    = max(CORNER_R, PLAYER_RADIUS + 0.01)
-    r     = PLAYER_RADIUS
-    p     = pos.copy()
-    v     = vel.copy()
+    r = PLAYER_RADIUS
+    p = pos.copy()
+    v = vel.copy()
+    cr = max(CORNER_R, r + 0.1)
+    limit = cr - r
 
-    in_left   = p[0] < cr + r
-    in_right  = p[0] > FIELD_W - cr - r
-    in_top    = p[1] < cr + r
-    in_bottom = p[1] > FIELD_H - cr - r
+    kx = 1 if p[0] < cr else (-1 if p[0] > FIELD_W - cr else 0)
+    ky = 1 if p[1] < cr else (-1 if p[1] > FIELD_H - cr else 0)
 
-    if (in_left or in_right) and (in_top or in_bottom):
-        cx = cr if (p[0] < FIELD_W / 2) else FIELD_W - cr
-        cy = cr if (p[1] < FIELD_H / 2) else FIELD_H - cr
-        to_player = p - np.array([cx, cy])
-        dist      = np.linalg.norm(to_player)
-        limit     = cr - r
-        if limit > 0 and dist < limit and dist > 1e-6:
-            p = np.array([cx, cy]) + (to_player / dist) * limit
-            normal = to_player / dist
-            if np.dot(v, normal) < 0:
+    if kx != 0 and ky != 0:
+        cx = cr if kx == 1 else FIELD_W - cr
+        cy = cr if ky == 1 else FIELD_H - cr
+        center = np.array([cx, cy])
+        to_p = p - center
+        dist = np.linalg.norm(to_p)
+
+        if dist > limit:
+            normal = to_p / (dist + 1e-8)
+            p = center + normal * limit
+            # Slide along the curve (cancel normal velocity)
+            if np.dot(v, normal) > 0:
                 v -= np.dot(v, normal) * normal
-        elif dist <= 1e-6:
-            # Push away from corner center toward field center
-            to_center = np.array([FIELD_W / 2, FIELD_H / 2]) - p
-            n = to_center / (np.linalg.norm(to_center) + 1e-8)
-            p += n * max(limit, 0.1)
 
-    # Always clamp to straight walls as fallback
+    # Final safety clamp
     p = np.clip(p, [r, r], [FIELD_W - r, FIELD_H - r])
     return p, v
 
