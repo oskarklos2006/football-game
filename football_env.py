@@ -13,13 +13,18 @@ GOAL_Y1 = GOAL_Y0 + GOAL_H
 
 PLAYER_RADIUS = 1.6
 BALL_RADIUS   = 1.0
-MAX_SPEED     = 1.0
+MAX_SPEED     = 0.8
 MAX_STEPS     = 1000
 
-FRICTION   = 0.92
+FRICTION   = 0.94
 KICK_POWER = 1.2
 INERTIA    = 0.75
 CORNER_R   = 4.0   # visual/physics corner radius — safe for any value >= 0
+
+# Stalemate detection thresholds
+STALE_STEPS = 60   # steps between anchor snapshots
+STALE_DX    = 3.0  # X range the ball must exceed to not be stale
+STALE_DY    = 2.0  # Y range the ball must exceed to not be stale
 
 
 # ---------------------------------------------------------------------------
@@ -94,26 +99,36 @@ def _resolve_player_boundary(pos, vel):
 # Observation builder
 # ---------------------------------------------------------------------------
 def _make_obs(positions, velocities, ball_pos, ball_vel, team_idx, n):
-    own = list(range(n))      if team_idx == 0 else list(range(n, 2 * n))
-    opp = list(range(n, 2*n)) if team_idx == 0 else list(range(n))
+    # Determine who is who
+    p_idx = 0 if team_idx == 0 else 1
+    o_idx = 1 if team_idx == 0 else 0
 
-    def norm_p(p):
-        return np.array([p[0] / FIELD_W * 2 - 1,
-                         p[1] / FIELD_H * 2 - 1], dtype=np.float32)
+    # 1. Perspective-based goals (The "Compass")
+    # Team 0 scores at X=50, Team 1 scores at X=0
+    target_goal = np.array([FIELD_W if team_idx == 0 else 0.0, FIELD_H / 2])
+    own_goal = np.array([0.0 if team_idx == 0 else FIELD_W, FIELD_H / 2])
 
-    def norm_v(v):
-        return np.clip(np.array([v[0] / MAX_SPEED,
-                                 v[1] / MAX_SPEED], dtype=np.float32), -1, 1)
+    p = positions[p_idx]
+    v = velocities[p_idx]
+    opp = positions[o_idx]
 
-    parts = []
-    for i in own: parts += [norm_p(positions[i]), norm_v(velocities[i])]
-    for i in opp: parts += [norm_p(positions[i]), norm_v(velocities[i])]
-    parts.append(norm_p(ball_pos))
-    parts.append(np.clip(
-        np.array([ball_vel[0] / KICK_POWER,
-                  ball_vel[1] / KICK_POWER], dtype=np.float32), -1, 1
-    ))
-    return np.concatenate(parts)
+    # Helper for normalization
+    def norm_coord(vec, w, h):
+        return np.array([vec[0] / w, vec[1] / h], dtype=np.float32)
+
+    # 2. Build the 16-feature vector
+    obs = [
+        p[0] / FIELD_W * 2 - 1, p[1] / FIELD_H * 2 - 1,  # 0,1: Player Abs Pos
+        v[0] / MAX_SPEED, v[1] / MAX_SPEED,  # 2,3: Player Velocity
+        (ball_pos - p)[0] / FIELD_W, (ball_pos - p)[1] / FIELD_H,  # 4,5: Vector to Ball
+        (target_goal - p)[0] / FIELD_W, (target_goal - p)[1] / FIELD_H,  # 6,7: Vector to Scoring Goal
+        (own_goal - p)[0] / FIELD_W, (own_goal - p)[1] / FIELD_H,  # 8,9: Vector to Own Goal
+        ball_pos[0] / FIELD_W * 2 - 1, ball_pos[1] / FIELD_H * 2 - 1,  # 10,11: Ball Abs Pos
+        ball_vel[0] / KICK_POWER, ball_vel[1] / KICK_POWER,  # 12,13: Ball Velocity
+        (opp - p)[0] / FIELD_W, (opp - p)[1] / FIELD_H  # 14,15: Vector to Opponent
+    ]
+
+    return np.array(obs, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -147,37 +162,72 @@ class SoccerEnv(gym.Env):
         self._score      = [0, 0]
         self._renderer   = None
 
+        # Stalemate detection state
+        self._stale_anchor      = np.zeros(2, dtype=np.float32)  # ball pos at last snapshot
+        self._stale_anchor_step = 0                               # step when snapshot was taken
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_positions(options=options)
         self._step_count = 0
+        self._stale_anchor[:]  = self._ball_pos
+        self._stale_anchor_step = 0
         return self._get_obs(), {"ball_pos": self._ball_pos.copy()}
 
     def _reset_positions(self, options=None):
         n = self.n
         margin = PLAYER_RADIUS + 2.0
-
-        for i in range(n):
-            self._pos[i] = [
-                self.np_random.uniform(margin, FIELD_W / 2 - 2.0),
-                self.np_random.uniform(margin, FIELD_H - margin)
-            ]
-            self._pos[n + i] = [
-                self.np_random.uniform(FIELD_W / 2 + 2.0, FIELD_W - margin),
-                self.np_random.uniform(margin, FIELD_H - margin)
-            ]
-
+        # Team A (Left side)
+        self._pos[0] = [FIELD_W * 0.2, FIELD_H / 2]
+        # Team B (Right side)
+        self._pos[1] = [FIELD_W * 0.8, FIELD_H / 2]
         self._vel[:] = 0
 
-        if options is not None and "ball_pos" in options:
+        if options and "ball_pos" in options:
             self._ball_pos[:] = options["ball_pos"]
         else:
-            self._ball_pos[:] = [
-                self.np_random.uniform(margin, FIELD_W - margin),
-                self.np_random.uniform(margin, FIELD_H - margin)
-            ]
-
+            # Force the ball to start in the middle more often to break stalemates
+            if self.np_random.random() < 0.5:
+                self._ball_pos[:] = [FIELD_W / 2, self.np_random.uniform(margin, FIELD_H - margin)]
+            else:
+                self._ball_pos[:] = [self.np_random.uniform(margin, FIELD_W - margin),
+                                     self.np_random.uniform(margin, FIELD_H - margin)]
         self._ball_vel[:] = 0
+
+    def _teleport_ball(self):
+        """Move the ball to a random location away from all players."""
+        margin = BALL_RADIUS + PLAYER_RADIUS + 2.0
+        for _ in range(50):  # up to 50 attempts to find a clear spot
+            x = self.np_random.uniform(margin, FIELD_W - margin)
+            y = self.np_random.uniform(margin, FIELD_H - margin)
+            candidate = np.array([x, y], dtype=np.float32)
+            # Ensure the candidate is not too close to any player
+            min_dist = min(np.linalg.norm(candidate - self._pos[i])
+                           for i in range(2 * self.n))
+            if min_dist >= PLAYER_RADIUS + BALL_RADIUS + 1.0:
+                break
+        self._ball_pos[:] = candidate
+        self._ball_vel[:] = 0.0
+
+    def _check_stalemate(self):
+        """
+        Every STALE_STEPS steps, check whether the ball has moved more than
+        STALE_DX in X or STALE_DY in Y since the last snapshot.  If not,
+        teleport it to a fresh location and reset the anchor.
+        """
+        steps_since = self._step_count - self._stale_anchor_step
+        if steps_since < STALE_STEPS:
+            return
+
+        dx = abs(self._ball_pos[0] - self._stale_anchor[0])
+        dy = abs(self._ball_pos[1] - self._stale_anchor[1])
+
+        if dx <= STALE_DX and dy <= STALE_DY:
+            self._teleport_ball()
+
+        # Always refresh the anchor after each check window
+        self._stale_anchor[:]  = self._ball_pos
+        self._stale_anchor_step = self._step_count
 
     def step(self, actions):
         n, N = self.n, 2 * self.n
@@ -255,10 +305,17 @@ class SoccerEnv(gym.Env):
             ra, rb = 1.0, -1.0
             self._score[0] += 1
             self._reset_positions()
+            self._stale_anchor[:]   = self._ball_pos
+            self._stale_anchor_step = self._step_count
         elif goal == "team_b":
             ra, rb = -1.0, 1.0
             self._score[1] += 1
             self._reset_positions()
+            self._stale_anchor[:]   = self._ball_pos
+            self._stale_anchor_step = self._step_count
+        else:
+            # --- stalemate detection (only when no goal was just scored) ---
+            self._check_stalemate()
 
         self._step_count += 1
         truncated = self._step_count >= MAX_STEPS
