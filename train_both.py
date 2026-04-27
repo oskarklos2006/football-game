@@ -10,32 +10,37 @@ from stable_baselines3.common.callbacks import BaseCallback
 from football_env import SoccerEnv, FIELD_W, FIELD_H, PLAYER_RADIUS, BALL_RADIUS
 
 # ---------------------------------------------------------------------------
-# Config
+# File paths and training schedule.
+# LOAD_* are the seed models read at the very start; SAVE_* are the checkpoints
+# that get overwritten after each role's training and reloaded by the opponent
+# in the next round — this is what makes co-training iterative.
 # ---------------------------------------------------------------------------
-LOAD_A_PATH  = "good_attacker"   # loaded once at the start
-LOAD_B_PATH  = "good_defender"   # loaded once at the start
-SAVE_A_PATH  = "best_attacker"   # saved and reloaded every round
-SAVE_B_PATH  = "best_defender"   # saved and reloaded every round
+LOAD_A_PATH = "good_attacker"
+LOAD_B_PATH = "good_defender"
+SAVE_A_PATH = "best_attacker"
+SAVE_B_PATH = "best_defender"
 
-N_ENVS  = 8
-ROUNDS  = 1
-STEPS   = 250_000
+N_ENVS = 8
+ROUNDS = 1
+STEPS  = 250_000
 
 OBS_SIZE_A = 12
 OBS_SIZE_B = 16
 
-# Defender positioning constants
-GOAL_Y0        = (FIELD_H - 10.0) / 2
-GOAL_Y1        = GOAL_Y0 + 10.0
-GOAL_CENTER_Y  = FIELD_H / 2
-SHADOW_GAP_MIN = 6.0
-SHADOW_GAP_MAX = 22.0
-GK_X           = FIELD_W * 0.92
-TRAJECTORY_STEPS  = 12
+# Defender geometry constants — used by the shadow positioning helpers below.
+GOAL_Y0       = (FIELD_H - 10.0) / 2
+GOAL_Y1       = GOAL_Y0 + 10.0
+GOAL_CENTER_Y = FIELD_H / 2
+SHADOW_GAP_MIN   = 6.0
+SHADOW_GAP_MAX   = 22.0
+GK_X             = FIELD_W * 0.92
+TRAJECTORY_STEPS = 12
 ATTACK_MODE_RATIO = 2.0
 
 # ---------------------------------------------------------------------------
-# Annealing
+# LR, entropy, gamma, and GAE-lambda schedule across rounds.
+# Values step down each round so the model makes large exploratory updates
+# early and fine-grained refinements later.
 # ---------------------------------------------------------------------------
 ANNEALING = [
     (3.0e-4, 0.05, 0.97, 0.93),
@@ -46,7 +51,10 @@ ANNEALING = [
 
 
 # ---------------------------------------------------------------------------
-# Observation builders
+# Observation builders — one per role.
+# Attacker sees 12 features (own state + ball + target goal).
+# Defender sees 16 features (same + own-goal vector + opponent vector)
+# because positional awareness relative to both goals matters for defending.
 # ---------------------------------------------------------------------------
 def get_obs_attacker(env):
     p, v   = env._pos[0], env._vel[0]
@@ -55,9 +63,9 @@ def get_obs_attacker(env):
     return np.array([
         p[0] / FIELD_W * 2 - 1, p[1] / FIELD_H * 2 - 1,
         v[0], v[1],
-        (b - p)[0] / FIELD_W,   (b - p)[1] / FIELD_H,
+        (b - p)[0] / FIELD_W,      (b - p)[1] / FIELD_H,
         (target - p)[0] / FIELD_W, (target - p)[1] / FIELD_H,
-        b[0] / FIELD_W * 2 - 1, b[1] / FIELD_H * 2 - 1,
+        b[0] / FIELD_W * 2 - 1,   b[1] / FIELD_H * 2 - 1,
         bv[0], bv[1],
     ], dtype=np.float32)
 
@@ -71,19 +79,24 @@ def get_obs_defender(env):
     return np.array([
         p[0] / FIELD_W * 2 - 1, p[1] / FIELD_H * 2 - 1,
         v[0], v[1],
-        (b - p)[0] / FIELD_W,   (b - p)[1] / FIELD_H,
+        (b - p)[0] / FIELD_W,      (b - p)[1] / FIELD_H,
         (target - p)[0] / FIELD_W, (target - p)[1] / FIELD_H,
-        b[0] / FIELD_W * 2 - 1, b[1] / FIELD_H * 2 - 1,
+        b[0] / FIELD_W * 2 - 1,   b[1] / FIELD_H * 2 - 1,
         bv[0], bv[1],
-        (own - p)[0] / FIELD_W,  (own - p)[1] / FIELD_H,
-        (opp - p)[0] / FIELD_W,  (opp - p)[1] / FIELD_H,
+        (own - p)[0] / FIELD_W,    (own - p)[1] / FIELD_H,
+        (opp - p)[0] / FIELD_W,    (opp - p)[1] / FIELD_H,
     ], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Defender positioning helpers
+# Defender positioning helpers.
+# These compute analytically where the defender *should* stand given the
+# current ball state, so the reward function can penalise deviation from it.
+# Three modes: A = intercept an on-target shot, B = chase a deflected ball,
+# C = shadow the ball from a gap between ball and own goal.
 # ---------------------------------------------------------------------------
 def predict_ball_intercept(ball_pos, ball_vel, steps=TRAJECTORY_STEPS, friction=0.94):
+    # Roll the ball forward `steps` ticks under friction to estimate where it ends up.
     pos, vel = ball_pos.copy(), ball_vel.copy()
     for _ in range(steps):
         pos = pos + vel
@@ -94,6 +107,7 @@ def predict_ball_intercept(ball_pos, ball_vel, steps=TRAJECTORY_STEPS, friction=
 
 
 def get_shot_target_y(ball_pos, ball_vel):
+    # Linear extrapolation: where does the ball's current trajectory cross x=FIELD_W?
     if ball_vel[0] <= 0:
         return None
     dx = FIELD_W - ball_pos[0]
@@ -111,22 +125,29 @@ def compute_shadow_ideal(ball_pos, ball_vel, player_pos):
 
     if ball_heading_goal and shot_target_y is not None:
         if GOAL_Y0 - 3.0 <= shot_target_y <= GOAL_Y1 + 3.0:
-            intercept_x  = np.clip(max(player_pos[0] + 1.0, ball_pos[0] + 1.0),
-                                   ball_pos[0], GK_X - 1.0)
+            # Mode A: ball is heading on target — step into the shot line.
+            intercept_x = np.clip(
+                max(player_pos[0] + 1.0, ball_pos[0] + 1.0),
+                ball_pos[0], GK_X - 1.0,
+            )
             return np.array([intercept_x,
                              np.clip(shot_target_y, GOAL_Y0 - 1.0, GOAL_Y1 + 1.0)]), "A"
         else:
-            fb   = predict_ball_intercept(ball_pos, ball_vel)
-            ftg  = own_goal - fb
+            # Mode B: ball heading off-target — track the predicted landing spot.
+            fb  = predict_ball_intercept(ball_pos, ball_vel)
+            ftg = own_goal - fb
             return fb + (ftg / (np.linalg.norm(ftg) + 1e-8)) * 4.0, "B"
     else:
-        btg  = own_goal - ball_pos
-        gap  = SHADOW_GAP_MIN + (1.0 - ball_x_norm) * (SHADOW_GAP_MAX - SHADOW_GAP_MIN)
+        # Mode C: ball not moving toward goal — hold a gap between ball and own goal.
+        btg = own_goal - ball_pos
+        gap = SHADOW_GAP_MIN + (1.0 - ball_x_norm) * (SHADOW_GAP_MAX - SHADOW_GAP_MIN)
         return ball_pos + (btg / (np.linalg.norm(btg) + 1e-8)) * gap, "C"
 
 
 # ---------------------------------------------------------------------------
-# Attacker environment
+# AttackerEnv — single-agent wrapper where team_a is the learner.
+# The opponent (defender) is the latest SAVE_B checkpoint, reloaded each
+# episode so the attacker always trains against the current best defender.
 # ---------------------------------------------------------------------------
 class AttackerEnv(gym.Env):
     def __init__(self):
@@ -139,7 +160,6 @@ class AttackerEnv(gym.Env):
         self.opp_model = None
 
     def _load_opponent(self):
-        # Always load the latest saved best_defender
         if os.path.exists(f"{SAVE_B_PATH}.zip"):
             self.opp_model = PPO.load(SAVE_B_PATH)
 
@@ -159,7 +179,7 @@ class AttackerEnv(gym.Env):
 
         _, env_rews, terminated, truncated, info = self.env.step({
             "team_a": act_a,
-            "team_b": act_b.reshape(1, 2)
+            "team_b": act_b.reshape(1, 2),
         })
 
         reward        = 0.0
@@ -169,12 +189,14 @@ class AttackerEnv(gym.Env):
         dist_att_ball = np.linalg.norm(att_pos - ball_pos)
         touch_range   = PLAYER_RADIUS + BALL_RADIUS + 2.0
 
+        # Primary sparse signals.
         if env_rews["team_a"] > 0:
             reward += 20.0
         if env_rews["team_b"] > 0:
             reward -= 15.0
 
-        # lightweight shoot anchor — keeps shooting skill alive
+        # Dense anchor: reward forward ball momentum when in contact so the
+        # agent doesn't unlearn shooting while adapting to the defender.
         if dist_att_ball < touch_range and ball_vel[0] > 0.1:
             reward += abs(ball_vel[0]) * 0.8
 
@@ -182,7 +204,10 @@ class AttackerEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
-# Defender environment
+# DefenderEnv — single-agent wrapper where team_b is the learner.
+# The opponent (attacker) is the latest SAVE_A checkpoint, reloaded each
+# episode. Reward combines sparse goal outcomes with dense positioning shaped
+# by compute_shadow_ideal so the defender learns to block before it concedes.
 # ---------------------------------------------------------------------------
 class DefenderEnv(gym.Env):
     def __init__(self):
@@ -196,7 +221,6 @@ class DefenderEnv(gym.Env):
         self._kicked   = False
 
     def _load_opponent(self):
-        # Always load the latest saved best_attacker
         if os.path.exists(f"{SAVE_A_PATH}.zip"):
             self.opp_model = PPO.load(SAVE_A_PATH)
 
@@ -217,7 +241,7 @@ class DefenderEnv(gym.Env):
 
         _, env_rews, terminated, truncated, info = self.env.step({
             "team_a": act_a.reshape(1, 2),
-            "team_b": act_b
+            "team_b": act_b,
         })
 
         reward     = 0.0
@@ -231,6 +255,8 @@ class DefenderEnv(gym.Env):
         px            = player_pos[0]
         touch_range   = PLAYER_RADIUS + BALL_RADIUS + 2.0
 
+        # Counter-attack mode: defender has the ball effectively alone.
+        # _kicked latches True once a counter-kick is made to avoid double-rewarding.
         opp_is_far   = dist_att_ball >= dist_p_ball * ATTACK_MODE_RATIO
         in_touch     = dist_p_ball < touch_range
         counter_mode = opp_is_far and not self._kicked
@@ -239,12 +265,16 @@ class DefenderEnv(gym.Env):
         if not self._kicked and in_touch and counter_mode and ball_vel[0] < -0.1:
             self._kicked = True
 
+        # Primary sparse signals — conceding is penalised more than scoring is rewarded
+        # to discourage the defender from gambling forward.
         if env_rews["team_b"] > 0:
             reward += 20.0
         if env_rews["team_a"] > 0:
             reward -= 35.0
 
-        # lightweight shadow anchor — keeps positioning skill alive
+        # Dense shadow reward: Gaussian around the analytically ideal position.
+        # Sigma varies by mode so the reward is tighter when a shot is imminent (A)
+        # and looser during open play (C).
         shadow_ideal, mode = compute_shadow_ideal(ball_pos, ball_vel, player_pos)
         shadow_ideal[0] = np.clip(shadow_ideal[0], PLAYER_RADIUS + 1, GK_X - 1.0)
         shadow_ideal[1] = np.clip(shadow_ideal[1], PLAYER_RADIUS + 1, FIELD_H - PLAYER_RADIUS - 1)
@@ -252,10 +282,14 @@ class DefenderEnv(gym.Env):
         sigma = {"A": 2.0, "B": 4.0, "C": 5.0}[mode]
         reward += np.exp(-(dist_shadow ** 2) / (2 * sigma ** 2)) * 0.6
 
+        # Penalise the defender for drifting past the GK line — it should never
+        # go deeper than its own goal mouth.
         if px > GK_X:
             gk_depth = (px - GK_X) / (FIELD_W - GK_X)
             reward  -= 1.0 + gk_depth * 1.5
 
+        # Counter-attack vs normal-play kicking rewards.
+        # Counter gets a bigger multiplier to encourage decisive clearances.
         if counter_mode:
             if in_touch and ball_vel[0] < -0.1:
                 reward += abs(ball_vel[0]) * 3.0
@@ -270,7 +304,9 @@ class DefenderEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
-# Annealing callback
+# Callback that linearly interpolates LR and entropy coefficient across the
+# duration of a single training call, bridging from this round's values to
+# the next round's values for a smooth transition.
 # ---------------------------------------------------------------------------
 class AnnealCallback(BaseCallback):
     def __init__(self, total_steps, lr_start, ent_start, lr_end, ent_end):
@@ -289,20 +325,20 @@ class AnnealCallback(BaseCallback):
 
 
 # ---------------------------------------------------------------------------
-# Generic train helper
+# Generic training helper shared by both roles.
+# Load priority: SAVE_PATH (refined checkpoint) > LOAD_PATH (seed model) >
+# create from scratch. This lets rounds resume cleanly if interrupted.
 # ---------------------------------------------------------------------------
 def train_role(env_class, load_path, save_path, round_idx):
-    lr, ent, gamma, gae = ANNEALING[round_idx]
-    next_lr, next_ent   = ANNEALING[min(round_idx + 1, len(ANNEALING) - 1)][:2]
+    lr, ent, gamma, gae   = ANNEALING[round_idx]
+    next_lr, next_ent     = ANNEALING[min(round_idx + 1, len(ANNEALING) - 1)][:2]
 
     env = SubprocVecEnv([lambda: Monitor(env_class())] * N_ENVS)
 
     if os.path.exists(f"{save_path}.zip"):
-        # subsequent rounds — load from save_path (already refined)
         print(f"    Loading checkpoint: {save_path}.zip")
         model = PPO.load(save_path, env=env)
     elif os.path.exists(f"{load_path}.zip"):
-        # first round — load from the input model
         print(f"    Loading base model: {load_path}.zip")
         model = PPO.load(load_path, env=env)
     else:
@@ -313,7 +349,7 @@ def train_role(env_class, load_path, save_path, round_idx):
                     n_steps=2048, batch_size=64,
                     n_epochs=10, clip_range=0.2)
 
-    # Apply this round's hyperparams
+    # Overwrite the loaded model's hyperparams with this round's schedule values.
     model.learning_rate = lr
     model.ent_coef      = ent
     model.gamma         = gamma
@@ -321,9 +357,9 @@ def train_role(env_class, load_path, save_path, round_idx):
     model.policy.optimizer.param_groups[0]["lr"] = lr
 
     model.learn(
-        total_timesteps = STEPS,
-        callback = AnnealCallback(STEPS, lr, ent, next_lr, next_ent),
-        progress_bar = True,
+        total_timesteps=STEPS,
+        callback=AnnealCallback(STEPS, lr, ent, next_lr, next_ent),
+        progress_bar=True,
     )
 
     model.save(save_path)
@@ -332,7 +368,10 @@ def train_role(env_class, load_path, save_path, round_idx):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point.
+# Each round trains the attacker first (against the frozen current defender),
+# then trains the defender (against the freshly updated attacker).
+# Alternating like this prevents one role from getting too far ahead.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 60)
@@ -343,7 +382,6 @@ if __name__ == "__main__":
           f"{ROUNDS * STEPS * 2:,} total steps")
     print("=" * 60)
 
-    # Verify input models exist before starting
     for path in [LOAD_A_PATH, LOAD_B_PATH]:
         if not os.path.exists(f"{path}.zip"):
             print(f"\nERROR: {path}.zip not found. "

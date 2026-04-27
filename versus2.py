@@ -4,157 +4,117 @@ import pygame
 from stable_baselines3 import PPO
 from football_env import SoccerEnv, FIELD_W, FIELD_H
 
-# ==========================================
-# MODELS
-# ==========================================
-ATTACKER_PATH = "best_attacker"   # trained: Team A left side, scores at x=FIELD_W
-DEFENDER_PATH = "best_defender"   # trained: Team B right side, defends x=FIELD_W
+# ---------------------------------------------------------------------------
+# Model paths — one attacker and one defender model, each reused twice.
+# ---------------------------------------------------------------------------
+ATTACKER_PATH = "best_attacker"
+DEFENDER_PATH = "best_defender"
 
 N_EPISODES = 5
 RENDER     = True
 
 # ---------------------------------------------------------------------------
-# Who plays where:
+# Player layout and the mirroring problem.
 #
 #   x=0 (left goal)                         x=50 (right goal)
-#   Team A defends                           Team B defends
 #
-#   player 0 = Team A ATTACKER  → scores at x=50  → trained side, NO mirror
-#   player 1 = Team A DEFENDER  → defends  x=0    → OPPOSITE side, needs mirror
-#   player 2 = Team B ATTACKER  → scores at x=0   → OPPOSITE side, needs mirror
-#   player 3 = Team B DEFENDER  → defends  x=50   → trained side, NO mirror
+#   player 0  Team A attacker  → scores at x=50  → trained side, no mirror
+#   player 1  Team A defender  → defends  x=0    → opposite side, needs mirror
+#   player 2  Team B attacker  → scores at x=0   → opposite side, needs mirror
+#   player 3  Team B defender  → defends  x=50   → trained side, no mirror
 #
-# Mirroring = flip x coordinates so the model sees the world
-# as if it were on its trained side.
+# Both models were trained on a specific side of the field. When a player is
+# deployed on the opposite side we mirror all x coordinates in the observation
+# so the model still perceives the world as if it were on its trained side,
+# then flip the x component of its output action back to real coordinates.
 # ---------------------------------------------------------------------------
 
 
-def mirror_x(val, field_w=FIELD_W):
-    """Flip a normalised x value: left becomes right and vice versa."""
-    return -val
-
+# ---------------------------------------------------------------------------
+# Observation builders — four variants (attacker/defender × normal/mirrored).
+# Y coordinates and velocities are never flipped; only x changes.
+# ---------------------------------------------------------------------------
 
 def get_obs_attacker_normal(env, player_idx):
-    """
-    Attacker obs — trained scoring at x=FIELD_W (right goal).
-    Used for Team A attacker (player 0). No mirroring needed.
-    """
-    p  = env._pos[player_idx]
-    v  = env._vel[player_idx]
-    b  = env._ball_pos
-    bv = env._ball_vel
-    target = np.array([FIELD_W, FIELD_H / 2])   # scores right
-
+    # Team A attacker (player 0): trained to score at x=FIELD_W — no transform needed.
+    p, v   = env._pos[player_idx], env._vel[player_idx]
+    b, bv  = env._ball_pos, env._ball_vel
+    target = np.array([FIELD_W, FIELD_H / 2])
     return np.array([
-        p[0] / FIELD_W * 2 - 1,   p[1] / FIELD_H * 2 - 1,
-        v[0],                      v[1],
-        (b - p)[0] / FIELD_W,     (b - p)[1] / FIELD_H,
+        p[0] / FIELD_W * 2 - 1,    p[1] / FIELD_H * 2 - 1,
+        v[0],                       v[1],
+        (b - p)[0] / FIELD_W,      (b - p)[1] / FIELD_H,
         (target - p)[0] / FIELD_W, (target - p)[1] / FIELD_H,
-        b[0] / FIELD_W * 2 - 1,   b[1] / FIELD_H * 2 - 1,
-        bv[0],                     bv[1],
+        b[0] / FIELD_W * 2 - 1,    b[1] / FIELD_H * 2 - 1,
+        bv[0],                      bv[1],
     ], dtype=np.float32)
 
 
 def get_obs_attacker_mirrored(env, player_idx):
-    """
-    Attacker obs — mirrored for Team B attacker (player 2) who scores at x=0.
-    Flip all x values so the model thinks it is on its trained (left) side
-    shooting toward x=FIELD_W.
-    """
-    p  = env._pos[player_idx]
-    v  = env._vel[player_idx]
-    b  = env._ball_pos
-    bv = env._ball_vel
-
-    # Mirrored positions: flip x around field center
-    p_mx  =  FIELD_W - p[0]
-    b_mx  =  FIELD_W - b[0]
-    target_mx = FIELD_W   # scoring goal appears on the right after mirror
-
+    # Team B attacker (player 2): scores at x=0, but model expects to score at x=FIELD_W.
+    # Flip x so the model sees a reflected field where its goal is still on the right.
+    p, v   = env._pos[player_idx], env._vel[player_idx]
+    b, bv  = env._ball_pos, env._ball_vel
+    p_mx   = FIELD_W - p[0]
+    b_mx   = FIELD_W - b[0]
     return np.array([
-        p_mx / FIELD_W * 2 - 1,              p[1] / FIELD_H * 2 - 1,
-        -v[0],                                v[1],          # vx flipped
-        (b_mx - p_mx) / FIELD_W,             (b[1] - p[1]) / FIELD_H,
-        (target_mx - p_mx) / FIELD_W,        0.0,           # target y offset = 0
-        b_mx / FIELD_W * 2 - 1,              b[1] / FIELD_H * 2 - 1,
-        -bv[0],                               bv[1],         # bvx flipped
+        p_mx / FIELD_W * 2 - 1,         p[1] / FIELD_H * 2 - 1,
+        -v[0],                           v[1],
+        (b_mx - p_mx) / FIELD_W,        (b[1] - p[1]) / FIELD_H,
+        (FIELD_W - p_mx) / FIELD_W,     0.0,
+        b_mx / FIELD_W * 2 - 1,         b[1] / FIELD_H * 2 - 1,
+        -bv[0],                          bv[1],
     ], dtype=np.float32)
 
 
 def get_obs_defender_normal(env, player_idx):
-    """
-    Defender obs — trained defending x=FIELD_W (right wall).
-    Used for Team B defender (player 3). No mirroring needed.
-    Closest opponent = Team A players (indices 0, 1).
-    """
-    p  = env._pos[player_idx]
-    v  = env._vel[player_idx]
-    b  = env._ball_pos
-    bv = env._ball_vel
-
-    # Pick nearest Team A player as the "attacker" reference
-    opp_indices = [0, 1]
-    opp = min([env._pos[i] for i in opp_indices],
-              key=lambda o: np.linalg.norm(o - b))
-
-    target = np.array([0.0,     FIELD_H / 2])   # scores left
-    own    = np.array([FIELD_W, FIELD_H / 2])   # defends right
-
+    # Team B defender (player 3): trained to defend x=FIELD_W — no transform needed.
+    # Uses the nearest Team A player as the "attacker" reference in the obs vector.
+    p, v   = env._pos[player_idx], env._vel[player_idx]
+    b, bv  = env._ball_pos, env._ball_vel
+    opp    = min([env._pos[i] for i in [0, 1]],
+                 key=lambda o: np.linalg.norm(o - b))
+    target = np.array([0.0,     FIELD_H / 2])
+    own    = np.array([FIELD_W, FIELD_H / 2])
     return np.array([
-        p[0] / FIELD_W * 2 - 1,   p[1] / FIELD_H * 2 - 1,
-        v[0],                      v[1],
-        (b - p)[0] / FIELD_W,     (b - p)[1] / FIELD_H,
+        p[0] / FIELD_W * 2 - 1,    p[1] / FIELD_H * 2 - 1,
+        v[0],                       v[1],
+        (b - p)[0] / FIELD_W,      (b - p)[1] / FIELD_H,
         (target - p)[0] / FIELD_W, (target - p)[1] / FIELD_H,
-        b[0] / FIELD_W * 2 - 1,   b[1] / FIELD_H * 2 - 1,
-        bv[0],                     bv[1],
-        (own - p)[0] / FIELD_W,   (own - p)[1] / FIELD_H,
-        (opp - p)[0] / FIELD_W,   (opp - p)[1] / FIELD_H,
+        b[0] / FIELD_W * 2 - 1,    b[1] / FIELD_H * 2 - 1,
+        bv[0],                      bv[1],
+        (own - p)[0] / FIELD_W,    (own - p)[1] / FIELD_H,
+        (opp - p)[0] / FIELD_W,    (opp - p)[1] / FIELD_H,
     ], dtype=np.float32)
 
 
 def get_obs_defender_mirrored(env, player_idx):
-    """
-    Defender obs — mirrored for Team A defender (player 1) who defends x=0.
-    Flip all x values so the model thinks it is on its trained (right) side
-    defending x=FIELD_W.
-    Closest opponent = Team B players (indices 2, 3).
-    """
-    p  = env._pos[player_idx]
-    v  = env._vel[player_idx]
-    b  = env._ball_pos
-    bv = env._ball_vel
-
-    # Pick nearest Team B player as the "attacker" reference
-    opp_indices = [2, 3]
-    opp = min([env._pos[i] for i in opp_indices],
-              key=lambda o: np.linalg.norm(o - b))
-
-    # Mirror all x coordinates
+    # Team A defender (player 1): defends x=0, but model expects to defend x=FIELD_W.
+    # Flip x so the model sees its goal on the right, then mirror the opponent too.
+    # Uses the nearest Team B player as the "attacker" reference.
+    p, v   = env._pos[player_idx], env._vel[player_idx]
+    b, bv  = env._ball_pos, env._ball_vel
+    opp    = min([env._pos[i] for i in [2, 3]],
+                 key=lambda o: np.linalg.norm(o - b))
     p_mx   = FIELD_W - p[0]
     b_mx   = FIELD_W - b[0]
     opp_mx = FIELD_W - opp[0]
-
-    # After mirror: target (scoring goal) is at x=FIELD_W, own goal at x=0
-    # But from the model's trained perspective it thinks:
-    #   own goal  = x=FIELD_W  (right)
-    #   score     = x=0        (left)
-    target_mx = 0.0      # scores left after mirror → appears as left to model
-    own_mx    = FIELD_W  # defends right after mirror
-
     return np.array([
-        p_mx / FIELD_W * 2 - 1,              p[1] / FIELD_H * 2 - 1,
-        -v[0],                                v[1],
-        (b_mx - p_mx) / FIELD_W,             (b[1] - p[1]) / FIELD_H,
-        (target_mx - p_mx) / FIELD_W,        0.0,
-        b_mx / FIELD_W * 2 - 1,              b[1] / FIELD_H * 2 - 1,
-        -bv[0],                               bv[1],
-        (own_mx - p_mx) / FIELD_W,           0.0,
-        (opp_mx - p_mx) / FIELD_W,           (opp[1] - p[1]) / FIELD_H,
+        p_mx / FIELD_W * 2 - 1,         p[1] / FIELD_H * 2 - 1,
+        -v[0],                           v[1],
+        (b_mx - p_mx) / FIELD_W,        (b[1] - p[1]) / FIELD_H,
+        (0.0 - p_mx) / FIELD_W,         0.0,
+        b_mx / FIELD_W * 2 - 1,         b[1] / FIELD_H * 2 - 1,
+        -bv[0],                          bv[1],
+        (FIELD_W - p_mx) / FIELD_W,     0.0,
+        (opp_mx - p_mx) / FIELD_W,      (opp[1] - p[1]) / FIELD_H,
     ], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Match
+# Match loop — loads both models once, then runs N_EPISODES.
+# Mirrored players have their action x flipped back to real coordinates
+# before being passed to the environment.
 # ---------------------------------------------------------------------------
 def run_match():
     print("\n>>> 2v2 MATCH")
@@ -165,7 +125,6 @@ def run_match():
     defender_model = PPO.load(DEFENDER_PATH)
 
     env = SoccerEnv(render_mode="human" if RENDER else None, n_players=2)
-
     if RENDER:
         pygame.init()
         clock = pygame.time.Clock()
@@ -184,48 +143,42 @@ def run_match():
                             env.close()
                             sys.exit()
 
-                # Team A
-                # player 0: attacker, trained side → normal obs
+                # Player 0: trained side — use action as-is.
                 obs_a0 = get_obs_attacker_normal(env, player_idx=0)
                 act_a0, _ = attacker_model.predict(obs_a0, deterministic=True)
 
-                # player 1: defender, opposite side → mirrored obs
+                # Player 1: mirrored obs — flip action x back to real coordinates.
                 obs_a1 = get_obs_defender_mirrored(env, player_idx=1)
                 act_a1_raw, _ = defender_model.predict(obs_a1, deterministic=True)
-                act_a1 = np.array([-act_a1_raw[0], act_a1_raw[1]])  # flip action x back
+                act_a1 = np.array([-act_a1_raw[0], act_a1_raw[1]])
 
-                # Team B
-                # player 2: attacker, opposite side → mirrored obs
+                # Player 2: mirrored obs — flip action x back to real coordinates.
                 obs_b0 = get_obs_attacker_mirrored(env, player_idx=2)
                 act_b0_raw, _ = attacker_model.predict(obs_b0, deterministic=True)
-                act_b0 = np.array([-act_b0_raw[0], act_b0_raw[1]])  # flip action x back
+                act_b0 = np.array([-act_b0_raw[0], act_b0_raw[1]])
 
-                # player 3: defender, trained side → normal obs
+                # Player 3: trained side — use action as-is.
                 obs_b1 = get_obs_defender_normal(env, player_idx=3)
                 act_b1, _ = defender_model.predict(obs_b1, deterministic=True)
 
-                actions_a = np.stack([act_a0, act_a1])   # shape (2, 2)
-                actions_b = np.stack([act_b0, act_b1])   # shape (2, 2)
-
                 _, _, terminated, truncated, info = env.step({
-                    "team_a": actions_a,
-                    "team_b": actions_b
+                    "team_a": np.stack([act_a0, act_a1]),
+                    "team_b": np.stack([act_b0, act_b1]),
                 })
 
                 done = terminated or truncated
-
                 if RENDER:
                     env.render()
                     clock.tick(60)
 
-            score = info["score"]
+            score    = info["score"]
             a_goals += score[0]
             b_goals += score[1]
             print(f"Ep {ep+1}: Team A {score[0]} - {score[1]} Team B")
 
-        print("\n" + "="*30)
+        print("\n" + "=" * 30)
         print(f" FINAL:  Team A {a_goals} - {b_goals} Team B")
-        print("="*30)
+        print("=" * 30)
 
     finally:
         env.close()
