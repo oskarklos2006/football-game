@@ -122,6 +122,8 @@ def obs_mf(env, player_idx, mate_idx):
     bto    = OWN - b
     danger = np.dot(bv / spd, bto / (np.linalg.norm(bto) + 1e-8))
     d2b    = np.linalg.norm(b - p)
+    d2mate = np.linalg.norm(mate - p)
+    closer = 1.0 if d2b < np.linalg.norm(b - mate) else 0.0
     return np.array([
         p[0] / FIELD_W * 2 - 1,          p[1] / FIELD_H * 2 - 1,
         np.clip(v[0], -1, 1),             np.clip(v[1], -1, 1),
@@ -133,7 +135,9 @@ def obs_mf(env, player_idx, mate_idx):
         mate[0] / FIELD_W * 2 - 1,        mate[1] / FIELD_H * 2 - 1,
         np.clip(mate_v[0], -1, 1),        np.clip(mate_v[1], -1, 1),
         np.clip(d2b / FIELD_W, 0, 1),
+        np.clip(d2mate / FIELD_W, 0, 1),  # feature 19 — dist to teammate
         np.clip(danger, -1, 1),
+        closer,                           # feature 21 — am I closer to ball
     ], dtype=np.float32)
 
 
